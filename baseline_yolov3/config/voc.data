@@ -1,0 +1,6 @@
+classes= 20
+train=../data/voc/2012_train.txt
+valid=../data/voc/2012_val.txt
+#difficult=data/difficult_2007_test.txt
+names=../data/voc.names
+backup=backup/

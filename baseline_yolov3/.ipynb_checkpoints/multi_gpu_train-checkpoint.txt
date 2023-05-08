@@ -1,0 +1,7 @@
+python -m torch.distributed.launch --nproc_per_node=num_GPU train.py --args para.
+
+
+#########
+ONLY AVAILIBLE FOR PYTORCH >= 1.10
+
+torchrun --nproc_per_node=num_GPU test_gpu.py --args para.

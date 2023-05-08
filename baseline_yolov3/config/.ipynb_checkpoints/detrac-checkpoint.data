@@ -1,0 +1,6 @@
+classes= 4
+train=../../../data/detrac/train.txt
+valid=../../../data/detrac/net_valid.txt
+test=../../../data/detrac/test/test.txt
+names=../data/detrac.names
+backup=backup/

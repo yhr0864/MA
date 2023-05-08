@@ -1,0 +1,2 @@
+sbatch run_server-auxilary.py --logger=./logger_aux1 --seed=2
+sbatch run_server-auxilary.py --logger=./logger_aux2 --seed=3

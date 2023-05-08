@@ -1,0 +1,504 @@
+#!/usr/bin/env python
+
+#SBATCH --job-name=yhr_yolov3-tiny_auxilary
+
+#SBATCH --error=%x.%j.err
+#SBATCH --output=%x.%j.out
+
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=15600920864@163.com
+
+#SBATCH --export=ALL
+
+#SBATCH --time=48:00:00
+
+#SBATCH --partition=sdil
+#SBATCH --gres=gpu:1
+
+from __future__ import division
+
+import sys
+sys.path.append("/pfs/data5/home/kit/tm/px6680/haoran/yolov3-test/test_yolov3_single_gpu/pytorchyolo/")
+
+import os
+import argparse
+import tqdm
+import numpy as np
+
+import torch
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from torch.autograd import Variable
+
+from models import load_model
+from utils.logger import Logger
+from utils.utils import (to_cpu, load_classes, print_environment_info, provide_determinism, worker_seed_set, ap_per_class, get_batch_statistics, non_max_suppression, xywh2xyxy)
+from utils.datasets import ListDataset
+from utils.augmentations import AUGMENTATION_TRANSFORMS
+from utils.transforms import DEFAULT_TRANSFORMS
+from utils.parse_config import parse_data_config
+from utils.loss import compute_loss
+# from test import _evaluate, _create_validation_data_loader
+
+from terminaltables import AsciiTable
+
+from torchsummary import summary
+import logging
+
+
+from quan import QuanConv2d, QuanAct, quantizer
+from torch.nn.modules.conv import Conv2d
+from torch.nn.modules.activation import LeakyReLU
+
+quan = {
+    'act': {
+        'mode': 'lsq',
+        # Bit width of quantized activation
+        'bit': 8,
+        # Each output channel uses its own scaling factor
+        'per_channel': False,
+        # Whether to use symmetric quantization
+        'symmetric': False,
+        # Quantize all the numbers to non-negative
+        'all_positive': True
+    },
+    'weight': {
+        'mode': 'lsq',
+        # Bit width of quantized activation
+        'bit': 8,
+        # Each output channel uses its own scaling factor
+        'per_channel': True,
+        # Whether to use symmetric quantization
+        'symmetric': False,
+        # Quantize all the numbers to non-negative
+        'all_positive': False
+    },
+    'excepts': {
+        # Specify quantized bit width for some layers, like this:
+        'conv1': {
+            'weight': {'bit': None},
+            'act': {'all_positive': False}
+        }
+    }
+}
+
+def model_quantize(model):
+    for m in model.modules():
+        if m.__str__().startswith('Sequential'):
+            if len(m) > 0 and isinstance(m[0], Conv2d):
+                m[0] = QuanConv2d(m[0],
+                              quan_w_fn=quantizer(quan['weight']),
+                              quan_a_fn=quantizer(quan['act']))
+
+            if len(m) > 2:
+                if isinstance(m[2], LeakyReLU):
+                    m[2] = QuanAct(m[2], quan_a_fn=quantizer(quan['act']))
+
+def get_logger(file_path):
+    """ Make python logger """
+    # [!] Since tensorboardX use default logger (e.g. logging.info()), we should use custom logger
+    logger = logging.getLogger('fbnet')
+    log_format = '%(asctime)s | %(message)s'
+    formatter = logging.Formatter(log_format, datefmt='%m/%d %I:%M:%S %p')
+    file_handler = logging.FileHandler(file_path)
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.setLevel(logging.INFO)
+
+    return logger
+
+def print_eval_stats(metrics_output, class_names, verbose):
+    if metrics_output is not None:
+        precision, recall, AP, f1, ap_class = metrics_output
+        if verbose:
+            # Prints class AP and mean AP
+            ap_table = [["Index", "Class", "AP"]]
+            for i, c in enumerate(ap_class):
+                ap_table += [[c, class_names[c], "%.5f" % AP[i]]]
+            print(AsciiTable(ap_table).table)
+        print(f"---- mAP {AP.mean():.5f} ----")
+    else:
+        print("---- mAP not measured (no detections found by model) ----")
+
+def _evaluate(model, dataloader, class_names, img_size, iou_thres, conf_thres, nms_thres, verbose):
+    """Evaluate model on validation dataset.
+
+    :param model: Model to evaluate
+    :type model: models.Darknet
+    :param dataloader: Dataloader provides the batches of images with targets
+    :type dataloader: DataLoader
+    :param class_names: List of class names
+    :type class_names: [str]
+    :param img_size: Size of each image dimension for yolo
+    :type img_size: int
+    :param iou_thres: IOU threshold required to qualify as detected
+    :type iou_thres: float
+    :param conf_thres: Object confidence threshold
+    :type conf_thres: float
+    :param nms_thres: IOU threshold for non-maximum suppression
+    :type nms_thres: float
+    :param verbose: If True, prints stats of model
+    :type verbose: bool
+    :return: Returns precision, recall, AP, f1, ap_class
+    """
+    model.eval()  # Set model to evaluation mode
+
+    Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+
+    labels = []
+    sample_metrics = []  # List of tuples (TP, confs, pred)
+    for _, imgs, targets in dataloader:
+        # Extract labels
+        labels += targets[:, 1].tolist()
+        # Rescale target
+        targets[:, 2:] = xywh2xyxy(targets[:, 2:])
+        targets[:, 2:] *= img_size
+
+        imgs = Variable(imgs.type(Tensor), requires_grad=False)
+
+        with torch.no_grad():
+            outputs = model(imgs)
+            outputs = non_max_suppression(outputs, conf_thres=conf_thres, iou_thres=nms_thres)
+
+        sample_metrics += get_batch_statistics(outputs, targets, iou_threshold=iou_thres)
+
+    if len(sample_metrics) == 0:  # No detections over whole validation set.
+        print("---- No detections over whole validation set ----")
+        return None
+
+    # Concatenate sample statistics
+    true_positives, pred_scores, pred_labels = [
+        np.concatenate(x, 0) for x in list(zip(*sample_metrics))]
+    metrics_output = ap_per_class(
+        true_positives, pred_scores, pred_labels, labels)
+
+    print_eval_stats(metrics_output, class_names, verbose)
+
+    return metrics_output
+
+
+def _create_validation_data_loader(img_path, batch_size, img_size, n_cpu):
+    """
+    Creates a DataLoader for validation.
+
+    :param img_path: Path to file containing all paths to validation images.
+    :type img_path: str
+    :param batch_size: Size of each image batch
+    :type batch_size: int
+    :param img_size: Size of each image dimension for yolo
+    :type img_size: int
+    :param n_cpu: Number of cpu threads to use during batch generation
+    :type n_cpu: int
+    :return: Returns DataLoader
+    :rtype: DataLoader
+    """
+    dataset = ListDataset(img_path, img_size=img_size, multiscale=False, transform=DEFAULT_TRANSFORMS)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=n_cpu,
+        pin_memory=True,
+        collate_fn=dataset.collate_fn)
+    return dataloader
+
+def _create_data_loader(img_path, batch_size, img_size, n_cpu, multiscale_training=False, multi_gpu=None):
+    """Creates a DataLoader for training.
+
+    :param img_path: Path to file containing all paths to training images.
+    :type img_path: str
+    :param batch_size: Size of each image batch
+    :type batch_size: int
+    :param img_size: Size of each image dimension for yolo
+    :type img_size: int
+    :param n_cpu: Number of cpu threads to use during batch generation
+    :type n_cpu: int
+    :param multiscale_training: Scale images to different sizes randomly
+    :type multiscale_training: bool
+    :return: Returns DataLoader
+    :rtype: DataLoader
+    """
+    dataset = ListDataset(
+        img_path,
+        img_size=img_size,
+        multiscale=multiscale_training,
+        transform=AUGMENTATION_TRANSFORMS) # AUGMENTATION_TRANSFORMS
+    if multi_gpu:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=n_cpu,
+            pin_memory=True,
+            collate_fn=dataset.collate_fn,
+            worker_init_fn=worker_seed_set)
+    else: 
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=n_cpu,
+            pin_memory=True,
+            collate_fn=dataset.collate_fn,
+            worker_init_fn=worker_seed_set)
+    return dataloader
+
+
+def train_loop(model, dataloader, validation_dataloader, optimizer,
+                class_names, epochs, device, args, logger2, logger):
+    
+    best_Acc = 0.
+    
+    for epoch in range(1, epochs):
+        model.train()  # Set model to training mode
+ 
+        logger2.info("\n---- Training Model ---- for epoch {}".format(epoch))
+        for batch_i, (_, imgs, targets) in enumerate(dataloader):
+            batches_done = len(dataloader) * epoch + batch_i
+
+            imgs = imgs.to(device, non_blocking=True) #[batch,3,416,416] 
+            targets = targets.to(device) #[batch,num_obj,5]
+
+            outputs = model(imgs) #[(bs,3,26,26,25),(bs,3,13,13,25)]
+
+            loss, loss_components = compute_loss(outputs, targets, model)
+
+            if batch_i % 100 == 0:
+
+                logger2.info("step {}/{}: loss: {:.5f} IoU loss: {:.5f} Object loss: {:.5f} Class loss: {:.5f}".format(batch_i,                                                                                                      len(dataloader),
+                                                                                             to_cpu(loss).item(),
+                                                                                             float(loss_components[0]),
+                                                                                             float(loss_components[1]),
+                                                                                             float(loss_components[2])))
+
+            loss.backward()
+
+            ###############
+            # Run optimizer
+            ###############
+
+            if batches_done % model.hyperparams['subdivisions'] == 0:
+                # Adapt learning rate
+                # Get learning rate defined in cfg
+                lr = model.hyperparams['learning_rate']
+                if batches_done < model.hyperparams['burn_in']:
+                    # Burn in
+                    lr *= (batches_done / model.hyperparams['burn_in'])
+                else:
+                    # Set and parse the learning rate to the steps defined in the cfg
+                    for threshold, value in model.hyperparams['lr_steps']:
+                        if batches_done > threshold:
+                            lr *= value
+                # Log the learning rate
+                # logger.scalar_summary("train/learning_rate", lr, batches_done)
+                # Set learning rate
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
+
+                # Run optimizer
+                optimizer.step()
+                # Reset gradients
+                optimizer.zero_grad()
+
+            # ############
+            # Log progress
+            # ############
+            if args.verbose:
+                print(AsciiTable(
+                    [
+                        ["Type", "Value"],
+                        ["IoU loss", float(loss_components[0])],
+                        ["Object loss", float(loss_components[1])],
+                        ["Class loss", float(loss_components[2])],
+                        ["Loss", float(loss_components[3])],
+                        ["Batch loss", to_cpu(loss).item()],
+                    ]).table)
+
+            # Tensorboard logging
+            tensorboard_log = [
+                ("train/iou_loss", float(loss_components[0])),
+                ("train/obj_loss", float(loss_components[1])),
+                ("train/class_loss", float(loss_components[2])),
+                ("train/loss", to_cpu(loss).item())]
+            # logger.list_of_scalars_summary(tensorboard_log, batches_done)
+
+            model.seen += imgs.size(0)   
+
+        # #############
+        # Save progress
+        # #############
+
+        # Save model to checkpoint file
+        if epoch % args.checkpoint_interval == 0:
+            checkpoint_path = f"current_yolov3.pth"
+            # logger2.info(f"---- Saving checkpoint to: '{checkpoint_path}' ----")
+            # torch.save(model.state_dict(), checkpoint_path)
+
+        # ########
+        # Evaluate
+        # ########
+
+
+        if epoch % args.evaluation_interval == 0:
+            logger2.info("\n---- Evaluating Model ----")
+            # Evaluate the model on the validation set
+            metrics_output = _evaluate(
+                model,
+                validation_dataloader,
+                class_names,
+                img_size=model.hyperparams['height'],
+                iou_thres=args.iou_thres,
+                conf_thres=args.conf_thres,
+                nms_thres=args.nms_thres,
+                verbose=args.verbose
+            )
+
+            if metrics_output is not None:
+                precision, recall, AP, f1, ap_class = metrics_output
+                logger2.info(f"---- best_Acc {best_Acc:.5f} ----")
+                logger2.info(f"---- mAP {AP.mean():.5f} ----")
+                if AP.mean() > best_Acc:
+
+                    best_Acc = AP.mean()
+                    if epoch % args.checkpoint_interval == 0:
+                        logger2.info("best AP found")
+                        #checkpoint_path = f"checkpoints/yolov3-super-tiny_{epoch}.pth"
+                        checkpoint_path = "best_yolov3.pth"
+                        # logger2.info(f"---- Saving checkpoint to: '{checkpoint_path}' ----")
+                        # torch.save(model.state_dict(), checkpoint_path)
+
+                evaluation_metrics = [
+                    ("validation/precision", precision.mean()),
+                    ("validation/recall", recall.mean()),
+                    ("validation/mAP", AP.mean()),
+                    ("validation/f1", f1.mean())]
+                # logger.list_of_scalars_summary(evaluation_metrics, epoch)
+
+
+def run():
+    print_environment_info()
+    parser = argparse.ArgumentParser(description="Trains the YOLO model.")
+    parser.add_argument("-m", "--model", type=str, default="../config/yolov3-tiny.cfg", help="Path to model definition file (.cfg)")
+    parser.add_argument("-d", "--data", type=str, default="../config/detrac.data", help="Path to data config file (.data)")
+    parser.add_argument("-e", "--epochs", type=int, default=2001, help="Number of epochs")
+    parser.add_argument("-v", "--verbose", action='store_true', help="Makes the training more verbose")
+    parser.add_argument("--n_cpu", type=int, default=12, help="Number of cpu threads to use during batch generation")
+    parser.add_argument("--pretrained_weights", type=str, help="Path to checkpoint file (.weights or .pth). Starts training from checkpoint model")
+    parser.add_argument("--checkpoint_interval", type=int, default=1, help="Interval of epochs between saving model weights")
+    parser.add_argument("--evaluation_interval", type=int, default=1, help="Interval of epochs between evaluations on validation set")
+    parser.add_argument("--multiscale_training", action="store_true", help="Allow multi-scale training")
+    parser.add_argument("--iou_thres", type=float, default=0.5, help="Evaluation: IOU threshold required to qualify as detected")
+    parser.add_argument("--conf_thres", type=float, default=0.1, help="Evaluation: Object confidence threshold")
+    parser.add_argument("--nms_thres", type=float, default=0.5, help="Evaluation: IOU threshold for non-maximum suppression")
+    parser.add_argument("--logdir", type=str, default="logs", help="Directory for training log files (e.g. for TensorBoard)")
+    parser.add_argument("--logger", type=str, default="./logger", help="Directory for training log files (e.g. for TensorBoard)")
+    parser.add_argument("--seed", type=int, default=1, help="Makes results reproducable. Set -1 to disable.")
+    args = parser.parse_args()
+    print(f"Command line arguments: {args}")
+
+    if args.seed != -1:
+        provide_determinism(args.seed)
+
+    logger = Logger(args.logdir)  # Tensorboard logger
+
+    # Create output directories if missing
+    os.makedirs("output", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
+    
+    logger2 = get_logger(args.logger)
+    
+    # Get data configuration
+    data_config = parse_data_config(args.data)
+    train_path = data_config["train"] #读取2012_train.txt,获得所有训练图片路径
+    valid_path = data_config["valid"]
+    class_names = load_classes(data_config["names"]) #读取voc.names获取所有类名
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ############
+    # Create model
+    # ############
+
+    #model = load_model(args.model,"./checkpoints/yolov3-super-tiny_4.pth")
+    model = load_model(args.model, qt=False)
+    
+#     total_params = sum(p.numel() for p in model.parameters())
+#     print(f'{total_params:,} total parameters.')
+#     total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#     print(f'{total_trainable_params:,} training parameters.')
+#     #print(model)
+    
+# if __name__ == "__main__":
+#     run()    
+
+    # Print model
+    if args.verbose:
+        summary(model, input_size=(3, model.hyperparams['height'], model.hyperparams['height']))
+
+    mini_batch_size = model.hyperparams['batch'] // model.hyperparams['subdivisions']
+
+    # #################
+    # Create Dataloader
+    # #################
+
+    # Load training dataloader
+    dataloader = _create_data_loader(
+        train_path, #2012_train.txt中的路径
+        mini_batch_size,
+        model.hyperparams['height'],
+        args.n_cpu,
+        args.multiscale_training)
+
+    # Load validation dataloader
+    validation_dataloader = _create_validation_data_loader(
+        valid_path,
+        mini_batch_size,
+        model.hyperparams['height'],
+        args.n_cpu)
+
+    # ################
+    # Create optimizer
+    # ################
+
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    if (model.hyperparams['optimizer'] in [None, "adam"]): #默认使用adam
+        optimizer = optim.Adam(
+            params,
+            lr=model.hyperparams['learning_rate'],
+            weight_decay=model.hyperparams['decay'],
+        )
+    elif (model.hyperparams['optimizer'] == "sgd"):
+        optimizer = optim.SGD(
+            params,
+            lr=model.hyperparams['learning_rate'],
+            weight_decay=model.hyperparams['decay'],
+            momentum=model.hyperparams['momentum'])
+    else:
+        print("Unknown optimizer. Please choose between (adam, sgd).")
+
+    # skip epoch zero, because then the calculations for when to evaluate/checkpoint makes more intuitive sense
+    # e.g. when you stop after 30 epochs and evaluate every 10 epochs then the evaluations happen after: 10,20,30
+    # instead of: 0, 10, 20
+    
+    logger2.info("start training the model without quant")
+    
+    train_loop(model, dataloader, validation_dataloader, optimizer,
+          class_names, args.epochs, device, args, logger2, logger)
+    
+#     logger2.info("quantize the model")
+#     model_quantize(model)
+    
+#     model.to(device)
+    
+
+
+      
+                      
+
+if __name__ == "__main__":
+    run()

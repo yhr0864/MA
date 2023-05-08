@@ -1,0 +1,21 @@
+Threshold should be less than 0.1267.
+The corresponding prune ratio limit is 0.852.
+Channels with Gamma value less than 0.066687 are pruned!
+mAP of the origin model is 0.82181
+Number of channels has been reduced from 3104 to 930
+Prune ratio in theory: 0.700 (setup manually!)
+mAP of the pseudo-pruned model is 0.4723
+layer index:   2 	 total channel:   32 	 remaining channel:   32
+layer index:   4 	 total channel:   64 	 remaining channel:   51
+layer index:   6 	 total channel:  128 	 remaining channel:  118
+layer index:   8 	 total channel:  256 	 remaining channel:  170
+layer index:  10 	 total channel:  512 	 remaining channel:  179
+layer index:  12 	 total channel: 1024 	 remaining channel:  139
+layer index:  13 	 total channel:  256 	 remaining channel:   78
+layer index:  14 	 total channel:  128 	 remaining channel:   22
+layer index:  16 	 total channel:  256 	 remaining channel:   93
+layer index:  17 	 total channel:  512 	 remaining channel:   99
+Prune channels: 2187	Prune ratio in real: 0.687
+reload the parameters...
+finish reloading!
+mAP of the real pruned model is 0.4591

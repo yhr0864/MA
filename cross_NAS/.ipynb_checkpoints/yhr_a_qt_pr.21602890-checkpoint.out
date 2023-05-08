@@ -1,0 +1,15 @@
+
+============================= JOB FEEDBACK =============================
+
+NodeName=uc2n562
+Job ID: 21602890
+Cluster: uc2
+User/Group: px6680/tm
+State: TIMEOUT (exit code 0)
+Nodes: 1
+Cores per node: 12
+CPU Utilized: 15-06:46:13
+CPU Efficiency: 63.67% of 24-00:01:36 core-walltime
+Job Wall-clock time: 2-00:00:08
+Memory Utilized: 113.94 GB
+Memory Efficiency: 0.00% of 0.00 MB

@@ -1,0 +1,5 @@
+Environment information:
+System: Linux 4.18.0-305.65.1.el8_4.x86_64
+Not using the poetry package
+No git or repo found
+Command line arguments: Namespace(checkpoint_interval=1, conf_thres=0.1, data='../config/detrac.data', epochs=2001, evaluation_interval=1, iou_thres=0.5, logdir='logs', model='../config/yolov3-tiny.cfg', multiscale_training=False, n_cpu=12, nms_thres=0.5, pretrained_weights=None, seed=1, verbose=False)

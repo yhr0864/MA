@@ -1,0 +1,36 @@
+Threshold should be less than 0.1267.
+The corresponding prune ratio limit is 0.852.
+Channels with Gamma value less than 0.033288 are pruned!
+mAP of the origin model is 0.82181
+Number of channels has been reduced from 3104 to 1241
+Prune ratio in theory: 0.600 (setup manually!)
+mAP of the pseudo-pruned model is 0.8212
+layer index:   2 	 total channel:   32 	 remaining channel:   32
+layer index:   4 	 total channel:   64 	 remaining channel:   51
+layer index:   6 	 total channel:  128 	 remaining channel:  119
+layer index:   8 	 total channel:  256 	 remaining channel:  170
+layer index:  10 	 total channel:  512 	 remaining channel:  320
+layer index:  12 	 total channel: 1024 	 remaining channel:  257
+layer index:  13 	 total channel:  256 	 remaining channel:  100
+layer index:  14 	 total channel:  128 	 remaining channel:   29
+layer index:  16 	 total channel:  256 	 remaining channel:  112
+layer index:  17 	 total channel:  512 	 remaining channel:  102
+Prune channels: 1876	Prune ratio in real: 0.589
+reload the parameters...
+finish reloading!
+mAP of the real pruned model is 0.7813
+
+============================= JOB FEEDBACK =============================
+
+NodeName=uc2n562
+Job ID: 21614544
+Cluster: uc2
+User/Group: px6680/tm
+State: COMPLETED (exit code 0)
+Nodes: 1
+Cores per node: 12
+CPU Utilized: 1-04:05:24
+CPU Efficiency: 72.90% of 1-14:32:00 core-walltime
+Job Wall-clock time: 03:12:40
+Memory Utilized: 57.87 GB
+Memory Efficiency: 0.00% of 0.00 MB
